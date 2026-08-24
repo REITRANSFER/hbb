@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect } from "react"
 import { Home, ArrowRight, ArrowLeft, Check, XCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { captureTrackingData, getIPAddress } from "@/lib/tracking"
+import { captureTrackingData, getIPAddress, readGfSid } from "@/lib/tracking"
 import { Input } from "@/components/ui/input"
 import { AddressAutocomplete, type AddressDetails, type ServiceArea } from "./address-autocomplete"
 
@@ -15,6 +15,9 @@ interface SurveyData {
   timeline: string
   condition: string
   reason: string
+  ownershipLength: string
+  firstName: string
+  lastName: string
   name: string
   email: string
   phone: string
@@ -68,7 +71,31 @@ const REASON_OPTIONS = [
   { id: "other", label: "Other" },
 ]
 
-// ─── Lead scoring (browser-side, no n8n changes) ───────────────────────
+// William's v2 reason list — rendered only when MOTIVATION_V2 is on (new clients).
+// The final option ("no-reason") is a hard-disqualifier: selecting it shows the
+// block screen and the lead is never submitted (see handleOptionSelect).
+const REASON_OPTIONS_V2 = [
+  { id: "foreclosure", label: "Facing foreclosure" },
+  { id: "behind-payments", label: "Behind on payments" },
+  { id: "inherited", label: "Inherited property" },
+  { id: "divorce", label: "Divorce or separation" },
+  { id: "repairs", label: "Can't afford repairs" },
+  { id: "vacant", label: "Vacant property I need to sell" },
+  { id: "urgent-financial", label: "Urgent financial situation not listed above" },
+  { id: "personal", label: "Personal situation not listed above" },
+  { id: "no-reason", label: "No reason / seeing what my house is worth" },
+]
+
+const OWNERSHIP_LENGTH_OPTIONS = [
+  { id: "less-than-3", label: "Less than 3 years" },
+  { id: "3-to-5", label: "3 to 5 years" },
+  { id: "5-to-10", label: "5 to 10 years" },
+  { id: "10-plus", label: "10+ years" },
+]
+
+// ─── Lead scoring (browser-side) ───────────────────────────────────────
+// Standard scoring matrix used across all REI Transfer client surveys.
+// Applied automatically when this template is cloned for a new client.
 const SCORE_TIMELINE: Record<string, number> = {
   'asap': 3, '2-weeks': 2, '30-days': 1, '60-days': 0, 'flexible': 0,
 }
@@ -77,6 +104,8 @@ const SCORE_REASON: Record<string, number> = {
   'inherited': 2, 'repairs': 2,
   'other': 1,
   'relocation': 0, 'divorce': 0, 'downsizing': 0,
+  // v2 list IDs (MOTIVATION_V2). 'no-reason' DQs pre-submit so its weight is moot.
+  'urgent-financial': 3, 'vacant': 2, 'personal': 1, 'no-reason': 0,
 }
 const SCORE_CONDITION: Record<string, number> = {
   'poor': 1, 'distressed': 1,
@@ -88,21 +117,24 @@ function calculateLeadScore(d: SurveyData): number {
   const c = SCORE_CONDITION[d.condition] ?? 0
   return Math.min(10, t + r + c)
 }
-function isQualifiedForMeta(d: SurveyData): boolean {
+function isQualifiedForMeta(d: SurveyData, excellentConditionPass = false): boolean {
   const okType = d.propertyType === 'single-family' || d.propertyType === 'multi-family'
   const okListed = d.listedOnMarket === 'not-listed'
   const okOwner = d.isLegalOwner !== 'no'
-  return okType && okListed && okOwner
+  // Opt-in pass-through (Option 3): when enabled, excellent no longer disqualifies.
+  const okCondition = excellentConditionPass || d.condition !== 'excellent'
+  return okType && okListed && okOwner && okCondition
 }
 function leadQuality(score: number): 'premium' | 'standard' | 'low' {
   if (score >= 6) return 'premium'
   if (score >= 2) return 'standard'
   return 'low'
 }
-function disqualifyReasonFor(d: SurveyData): string {
+function disqualifyReasonFor(d: SurveyData, excellentConditionPass = false): string {
   if (d.propertyType !== 'single-family' && d.propertyType !== 'multi-family') return 'property_type'
   if (d.listedOnMarket !== 'not-listed') return 'listed'
   if (d.isLegalOwner === 'no') return 'not_owner'
+  if (!excellentConditionPass && d.condition === 'excellent') return 'excellent_condition'
   return 'unknown'
 }
 // ──────────────────────────────────────────────────────────────────────
@@ -183,18 +215,41 @@ interface SurveyCardProps {
   phoneDisplay?: string
   phoneHref?: string
   serviceAreas?: ServiceArea[]
+  disqualifiedPropertyTypes?: string[]
+  // Comma-parsed ownership-length option IDs to hard-disqualify
+  // (DISQUALIFIED_OWNERSHIP_LENGTHS). Empty (default) → no ownership gate.
+  disqualifiedOwnershipLengths?: string[]
+  // 2-letter US state codes to ALLOW (ALLOWED_STATES). Empty → no state gate.
+  allowedStates?: string[]
+  // Additive seed props for the advertorial sticky-bar -> popup flow.
+  // When an address is captured in the sticky bar, we open the modal pre-seeded
+  // at step 2 so the user does not have to re-enter the address they already gave.
+  // These props do NOT change the form's submit, webhook, or redirect behavior.
+  initialAddress?: string
+  initialStep?: number
+  // When true (MOTIVATION_V2), render William's v2 reason list incl. the
+  // "no-reason" hard-disqualifier. Passed from the server page (config.motivationV2)
+  // — this client component must NOT import lib/config.
+  motivationV2?: boolean
+  // Opt-in (EXCELLENT_CONDITION_PASS): when true, excellent counts as a normal
+  // qualified Lead instead of a soft-DQ. Passed from the server page
+  // (config.excellentConditionPass); default false = current soft-DQ behavior.
+  excellentConditionPass?: boolean
 }
 
-export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "8000000000", serviceAreas = [] }: SurveyCardProps) {
-  const [step, setStep] = useState(1)
+export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "8000000000", serviceAreas = [], disqualifiedPropertyTypes = ["mobile-home", "land", "other"], disqualifiedOwnershipLengths = [], allowedStates = [], initialAddress, initialStep, motivationV2 = false, excellentConditionPass = false }: SurveyCardProps) {
+  const [step, setStep] = useState(initialStep && initialStep >= 2 && initialStep <= 8 ? initialStep : 1)
   const [surveyData, setSurveyData] = useState<SurveyData>({
-    address: "",
+    address: initialAddress ?? "",
     propertyType: "",
     isLegalOwner: "",
     listedOnMarket: "",
     timeline: "",
     condition: "",
     reason: "",
+    ownershipLength: "",
+    firstName: "",
+    lastName: "",
     name: "",
     email: "",
     phone: "",
@@ -213,7 +268,7 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
   }, [])
   const [honeypot, setHoneypot] = useState("")
 
-  const totalSteps = 8
+  const totalSteps = 9
 
   const handleNext = async () => {
     // Block out-of-area addresses on Continue with a disqualify screen
@@ -222,11 +277,13 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
       setIsDisqualified(true)
       return
     }
-    if (step === 8) {
+    if (step === totalSteps) {
       const errors: {[key: string]: string} = {}
 
-      const nameCheck = validateName(surveyData.name)
-      if (!nameCheck.valid) errors.name = nameCheck.msg
+      const firstCheck = validateName(surveyData.firstName)
+      if (!firstCheck.valid) errors.firstName = firstCheck.msg
+      const lastCheck = validateName(surveyData.lastName)
+      if (!lastCheck.valid) errors.lastName = lastCheck.msg
 
       const emailCheck = validateEmail(surveyData.email)
       if (!emailCheck.valid) errors.email = emailCheck.msg
@@ -253,16 +310,16 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
       setIsSubmitting(true)
 
       try {
-        const nameParts = surveyData.name.trim().split(/\s+/)
+        const fullName = `${surveyData.firstName.trim()} ${surveyData.lastName.trim()}`.trim()
         const score = calculateLeadScore(surveyData)
         const quality = leadQuality(score)
-        const qualified = isQualifiedForMeta(surveyData)
-        const dqReason = qualified ? null : disqualifyReasonFor(surveyData)
+        const qualified = isQualifiedForMeta(surveyData, excellentConditionPass)
+        const dqReason = qualified ? null : disqualifyReasonFor(surveyData, excellentConditionPass)
         const eventId = `lead-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
         const payload = {
-          firstName: nameParts[0] || '',
-          lastName: nameParts.slice(1).join(' ') || '',
-          name: surveyData.name,
+          firstName: surveyData.firstName.trim(),
+          lastName: surveyData.lastName.trim(),
+          name: fullName,
           email: surveyData.email,
           phone: surveyData.phone,
           address: surveyData.address,
@@ -271,6 +328,7 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
           condition: surveyData.condition,
           timeline: surveyData.timeline,
           reason: surveyData.reason,
+          ownershipLength: surveyData.ownershipLength,
           source: 'Survey Form',
           submittedAt: new Date().toISOString(),
           qualified,
@@ -280,20 +338,23 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
           meta_event_id: eventId,
           meta_event_name: qualified ? 'Lead' : 'LeadLowIntent',
           meta_value: qualified ? score * 25 : 0,
+          gf_sid: readGfSid(),
           ...trackingRef.current,
         }
         // Fire weighted Meta Pixel event (browser-side; CAPI is a separate later phase)
         if (typeof window !== 'undefined' && (window as { fbq?: (...args: unknown[]) => void }).fbq) {
           const fbq = (window as { fbq: (...args: unknown[]) => void }).fbq
+          // content_name uses the brand from config so each cloned client gets the right label automatically
+          const brandName = (typeof window !== 'undefined' && (window as unknown as { __NEXT_DATA__?: { runtimeConfig?: { companyName?: string } } }).__NEXT_DATA__?.runtimeConfig?.companyName) || 'REI Survey'
           if (qualified) {
             fbq('track', 'Lead', {
               value: score * 25, currency: 'USD',
-              content_name: 'HBB Survey', content_category: 'real_estate',
+              content_name: `${brandName} Survey`, content_category: 'real_estate',
               lead_score: score, lead_quality: quality,
             }, { eventID: eventId })
           } else {
             fbq('trackCustom', 'LeadLowIntent', {
-              content_name: 'HBB Survey', content_category: 'real_estate',
+              content_name: `${brandName} Survey`, content_category: 'real_estate',
               disqualify_reason: dqReason, lead_score: score,
             }, { eventID: eventId })
           }
@@ -326,8 +387,10 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
       case 5: return surveyData.timeline !== ""
       case 6: return surveyData.condition !== ""
       case 7: return surveyData.reason !== ""
-      case 8: return (
-        surveyData.name.trim().length > 0 &&
+      case 8: return surveyData.ownershipLength !== ""
+      case 9: return (
+        surveyData.firstName.trim().length > 0 &&
+        surveyData.lastName.trim().length > 0 &&
         surveyData.email.trim().length > 0 &&
         surveyData.phone.trim().length > 0
       )
@@ -338,7 +401,7 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
   const handleOptionSelect = (field: keyof SurveyData, value: string) => {
     setSurveyData({ ...surveyData, [field]: value })
 
-    if (field === "propertyType" && ["mobile-home", "land", "other"].includes(value)) {
+    if (field === "propertyType" && disqualifiedPropertyTypes.includes(value)) {
       setTimeout(() => { setDisqualifyReason("propertyType"); setIsDisqualified(true) }, 300)
       return
     }
@@ -348,6 +411,19 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
     }
     if (field === "isLegalOwner" && value === "no") {
       setTimeout(() => { setDisqualifyReason("notOwner"); setIsDisqualified(true) }, 300)
+      return
+    }
+    // Ownership-length hard DQ (DISQUALIFIED_OWNERSHIP_LENGTHS). Empty prop (default)
+    // → inert: [].includes(value) is always false, so the step advances as today.
+    if (field === "ownershipLength" && disqualifiedOwnershipLengths.includes(value)) {
+      setTimeout(() => { setDisqualifyReason("noEquity"); setIsDisqualified(true) }, 300)
+      return
+    }
+    // v2 motivation list (MOTIVATION_V2): "no reason / seeing what my house is
+    // worth" hard-disqualifies — block screen, lead never submitted. The id only
+    // exists in REASON_OPTIONS_V2, so this branch is inert for the legacy list.
+    if (field === "reason" && value === "no-reason") {
+      setTimeout(() => { setDisqualifyReason("noReason"); setIsDisqualified(true) }, 300)
       return
     }
 
@@ -401,6 +477,16 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
         message: "Unfortunately, we don't currently buy properties in that area.",
         detail: "We only serve select markets at this time. If you believe your property is within our coverage area, please try a different address or give us a call.",
       },
+      noReason: {
+        title: "Just Browsing?",
+        message: "It sounds like you're gathering information right now rather than looking to sell.",
+        detail: "When you're ready to sell, come back and we'll get you a fair cash offer. Feel free to call us any time if your situation changes.",
+      },
+      noEquity: {
+        title: "We're Unable to Make an Offer",
+        message: "Unfortunately, based on how long you've owned the property, there typically isn't enough equity for us to make a fair cash offer.",
+        detail: "If your situation changes or you'd like to discuss your options, feel free to give us a call. We're always happy to help.",
+      },
     }
     const msg = disqualifyMessages[disqualifyReason] || disqualifyMessages.notOwner
 
@@ -434,7 +520,7 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
             <Check className="h-7 w-7 text-[#22c55e]" />
           </div>
           <div>
-            <h2 className="text-2xl font-semibold text-gray-900">Thank You, {surveyData.name}!</h2>
+            <h2 className="text-2xl font-semibold text-gray-900">Thank You, {surveyData.firstName}!</h2>
             <p className="mt-2 text-gray-600">We've received your information and will be in touch shortly.</p>
             <p className="mt-4 text-sm text-gray-500">One of our team members will call you within 24 hours.</p>
           </div>
@@ -476,6 +562,7 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
               onSelect={handleAddressSelect}
               onOutOfArea={(addr) => { setSurveyData({ ...surveyData, address: addr }); setAddressVerified(true); setAddressOutOfArea(true) }}
               serviceAreas={serviceAreas}
+              allowedStates={allowedStates}
               placeholder="Start typing your address..."
             />
 
@@ -549,7 +636,7 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
               <p className="mt-1 text-sm text-gray-500">This helps us understand your situation better.</p>
             </div>
             <div className="grid grid-cols-2 gap-2">
-              {REASON_OPTIONS.map((option) => renderOptionButton(option, surveyData.reason, "reason"))}
+              {(motivationV2 ? REASON_OPTIONS_V2 : REASON_OPTIONS).map((option) => renderOptionButton(option, surveyData.reason, "reason"))}
             </div>
           </div>
         )}
@@ -557,21 +644,47 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
         {step === 8 && (
           <div className="flex flex-col gap-4">
             <div>
+              <h2 className="text-2xl font-semibold text-gray-900">How long have you owned the home?</h2>
+              <p className="mt-1 text-sm text-gray-500">This helps us tailor your offer.</p>
+            </div>
+            <div className="flex flex-col gap-2">
+              {OWNERSHIP_LENGTH_OPTIONS.map((option) => renderOptionButton(option, surveyData.ownershipLength, "ownershipLength"))}
+            </div>
+          </div>
+        )}
+
+        {step === 9 && (
+          <div className="flex flex-col gap-4">
+            <div>
               <h2 className="text-2xl font-semibold text-gray-900">How can we reach you?</h2>
               <p className="mt-1 text-sm text-gray-500">We'll use this to send you your cash offer.</p>
             </div>
             <div className="flex flex-col gap-3">
-              <div>
-                <Input
-                  placeholder="Your full name"
-                  value={surveyData.name}
-                  onChange={(e) => {
-                    setSurveyData({ ...surveyData, name: e.target.value })
-                    setValidationErrors({ ...validationErrors, name: "" })
-                  }}
-                  className={`h-12 rounded-xl border-gray-200 bg-white text-gray-900 placeholder:text-gray-400 focus:border-[var(--accent)] focus:ring-[var(--accent)]/20 ${validationErrors.name ? "border-red-500" : ""}`}
-                />
-                {validationErrors.name && <p className="mt-1 text-xs text-red-500">{validationErrors.name}</p>}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Input
+                    placeholder="First name"
+                    value={surveyData.firstName}
+                    onChange={(e) => {
+                      setSurveyData({ ...surveyData, firstName: e.target.value })
+                      setValidationErrors({ ...validationErrors, firstName: "" })
+                    }}
+                    className={`h-12 rounded-xl border-gray-200 bg-white text-gray-900 placeholder:text-gray-400 focus:border-[var(--accent)] focus:ring-[var(--accent)]/20 ${validationErrors.firstName ? "border-red-500" : ""}`}
+                  />
+                  {validationErrors.firstName && <p className="mt-1 text-xs text-red-500">{validationErrors.firstName}</p>}
+                </div>
+                <div>
+                  <Input
+                    placeholder="Last name"
+                    value={surveyData.lastName}
+                    onChange={(e) => {
+                      setSurveyData({ ...surveyData, lastName: e.target.value })
+                      setValidationErrors({ ...validationErrors, lastName: "" })
+                    }}
+                    className={`h-12 rounded-xl border-gray-200 bg-white text-gray-900 placeholder:text-gray-400 focus:border-[var(--accent)] focus:ring-[var(--accent)]/20 ${validationErrors.lastName ? "border-red-500" : ""}`}
+                  />
+                  {validationErrors.lastName && <p className="mt-1 text-xs text-red-500">{validationErrors.lastName}</p>}
+                </div>
               </div>
               <div>
                 <Input
@@ -589,7 +702,7 @@ export function SurveyCard({ phoneDisplay = "(800) 000-0000", phoneHref = "80000
               <div>
                 <Input
                   type="tel"
-                  placeholder="(301) 555-0000"
+                  placeholder="(555) 123-4567"
                   value={surveyData.phone}
                   onChange={(e) => {
                     setSurveyData({ ...surveyData, phone: formatPhoneNumber(e.target.value) })

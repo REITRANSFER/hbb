@@ -21,8 +21,12 @@ const config = {
   headlineAccent:  process.env.HEADLINE_ACCENT   ?? "",
   subheadline:     process.env.SUBHEADLINE       ?? "No fees. No repairs. Cash offer in 24 hours.",
 
-  // Service areas — JSON array of {id, centerLat, centerLng, radiusMiles}
+  // Service areas — JSON array of {id, centerLat, centerLng, radiusMiles}. Must be
+  // valid circle objects or "[]". NEVER a state-name array like ["Wisconsin"].
   serviceAreas:    process.env.SERVICE_AREAS     ?? "[]",
+  // Market name for advertorial copy ("Wisconsin"); empty renders "the areas we serve".
+  marketName:      process.env.MARKET_NAME       ?? "",
+  smsKeyword:      process.env.SMS_KEYWORD       ?? "OFFER",
 
   // Trust indicators
   stat1Value:      process.env.STAT_1_VALUE      ?? "1,000+",
@@ -40,8 +44,45 @@ const config = {
   privacyPolicyUrl: process.env.PRIVACY_POLICY_URL ?? "/privacy",
   termsUrl:         process.env.TERMS_URL           ?? "/terms",
 
+  // Survey disqualification — comma-separated property type IDs to hard-disqualify
+  disqualifiedPropertyTypes: process.env.DISQUALIFIED_PROPERTY_TYPES ?? "mobile-home,land,other",
+
+  // Survey disqualification — comma-separated ownership-length option IDs to hard-
+  // disqualify (e.g. "less-than-3,3-to-5" to block under-5-year owners). Valid IDs:
+  // less-than-3, 3-to-5, 5-to-10, 10-plus. Empty (default) → no ownership gate →
+  // byte-identical legacy behavior for all existing rei-survey-template@main
+  // projects that never set DISQUALIFIED_OWNERSHIP_LENGTHS.
+  disqualifiedOwnershipLengths: process.env.DISQUALIFIED_OWNERSHIP_LENGTHS ?? "",
+
+  // Geo allow-list — comma-separated 2-letter US state codes (e.g. "CA" or
+  // "CA,NV"). When set, any address whose state is NOT in the list is treated
+  // as out-of-area (blocked at step 1, no lead fires). Empty (default) → no geo
+  // gate → byte-identical legacy behavior for all existing rei-survey-template
+  // @main projects that never set ALLOWED_STATES.
+  allowedStates:   process.env.ALLOWED_STATES ?? "",
+
   // Webhook (server-side only — never exposed to browser)
   webhookUrl:      process.env.WEBHOOK_URL ?? "",
+
+  // Style flag — when IBUYKC_STYLE === "true" (default for new clients via the
+  // env-schema default), render the iBuyKC style: white page, accent only on
+  // buttons, dark text, enlarged logo, flexible owner/team photo. The ~17
+  // projects deploying rei-survey-template@main have no IBUYKC_STYLE env → falsy
+  // → byte-identical legacy style.
+  useIbuykcStyle:  process.env.IBUYKC_STYLE === "true",
+
+  // Motivation list flag — when MOTIVATION_V2 === "true" (default for new clients
+  // via the env-schema default), both forms (v1 homepage + /v3) render William's
+  // v2 reason-for-selling list, including the "No reason / seeing what my house is
+  // worth" hard-disqualifier. Existing rei-survey-template@main projects without
+  // this env → falsy → byte-identical legacy reason list, no disqualifier.
+  motivationV2:    process.env.MOTIVATION_V2 === "true",
+
+  // Excellent-condition pass-through (Option 3) — OPT-IN. When "true", excellent
+  // move-in-ready homes count as a normal qualified Lead instead of being soft-DQ'd
+  // to LeadLowIntent. Default false / unset → byte-identical soft-DQ behavior for
+  // every existing template-linked client.
+  excellentConditionPass: process.env.EXCELLENT_CONDITION_PASS === "true",
 } as const
 
 export default config
